@@ -1,13 +1,21 @@
-class Analyzer {
-  constructor(videoName, videoURL, workerType, workerSettings) {
+"use strict";
+
+class Differentiator {
+  constructor(videoName, videoURL, frameRate) {
+    const WORKER_URL = "differentiator_worker.js";
+    this.states = {
+      IDLE: Symbol("idle"),
+      READY: Symbol("ready"),
+      FINDING_DIFFERENCES: Symbol("finding differences"),
+      DONE: Symbol("done"),
+    };
     this._currentState = this.states.IDLE;
-    let workerURL = `worker_${workerType}.js`;
-    this._worker = new Worker(workerURL);
-    this._worker.postMessage({ name: "init", settings: workerSettings });
+
+    this._worker = new Worker(WORKER_URL);
+    this._worker.postMessage({ name: "init" });
     this._worker.addEventListener("message", this);
     this._videoName = videoName;
     this._videoURL = videoURL;
-
     this.waitUntilDone = new Promise((resolve, reject) => {
       this._workerResults = resolve;
       this._workerError = reject;
@@ -17,14 +25,33 @@ class Analyzer {
   handleEvent(message) {
     switch(message.data.name) {
       case "ready": {
-        this._currentState = this.states.READY;
+        this.currentState = this.states.READY;
         if (this._readyResolver) {
           this._readyResolver();
         }
         break;
       }
 
-      case "results": {
+      case "difference": {
+        console.assert(this.currentState == this.states.FINDING_DIFFERENCES);
+        console.assert(this._callbacks);
+        let difference = {
+          frameNum: message.data.frameNum,
+          rects: message.data.rects,
+        };
+        this._callbacks.onDifference(difference);
+        break;
+      }
+
+      case "update": {
+        console.assert(this.currentState == this.states.FINDING_DIFFERENCES);
+        console.assert(this._progressListener);
+        console.assert(this._totalFrameEstimate);
+        this._progressListener.onFramesProcessed(message.data.frameNum, this._totalFrameEstimate);
+        break;
+      }
+
+      case "finished": {
         this._workerResults(message.data.results);
         break;
       }
@@ -36,21 +63,38 @@ class Analyzer {
     }
   }
 
-  get states() {
-    return {
-      IDLE: Symbol("idle"),
-      READY: Symbol("ready"),
-      FINDING_ORIGIN: Symbol("finding origin"),
-      FINDING_KEY_TIMESTAMPS: Symbol("finding key timestamps"),
-      DONE: Symbol("done"),
-    }
-  }
-
   get currentState() {
     return this._currentState;
   }
 
-  async go() {
+  set currentState(stateTransition) {
+    switch(stateTransition) {
+      case this.states.IDLE: {
+        throw new Error("Did not expect to transition back to IDLE");
+        break;
+      }
+      case this.states.READY: {
+        console.assert(this.currentState == this.states.IDLE);
+        break;
+      }
+      case this.states.FINDING_DIFFERENCES: {
+        console.assert(this.currentState == this.states.READY);
+        console.assert(this._callbacks);
+        break;
+      }
+      case this.states.DONE: {
+        console.assert(this.currentState == this.states.FINDING_DIFFERENCES);
+        break;
+      }
+    }
+
+    this._currentState = stateTransition;
+  }
+
+  async go(callbacks, progressListener) {
+    this._callbacks = callbacks;
+    this._progressListener = progressListener;
+
     if (this.currentState != this.states.READY) {
       this.log("Waiting for worker to be ready.");
       await new Promise(resolve => {
@@ -59,27 +103,59 @@ class Analyzer {
     }
     this.log("Worker is ready.");
 
-    let { video, canvas, ctx } = await this.constructDOMElements(this._videoURL);
+    let { video, canvas, ctx, width, height } =
+      await this.constructDOMElements(this._videoURL);
     let ended = false;
     video.addEventListener("ended", () => {
       ended = true;
     }, { once: true });
 
+    this.log(`Video duration is ${video.duration} seconds`);
+
+    const FRAME_RATE = 60; // Playback is at 60fps, regardless of video encoding rate.
+    this._totalFrameEstimate = Math.ceil(video.duration * FRAME_RATE);
+
     let lastFrame = this.getFrame(video, ctx);
+    let currentFrame;
     let frameNum = 0;
 
-    while (!ended && frameNum < 15) {
+    this.currentState = this.states.FINDING_DIFFERENCES;
+
+    while (!ended) {
       await video.seekToNextFrame();
-      let currentFrame = this.getFrame(video, ctx);
-      this.sendFramePair(++frameNum, lastFrame, currentFrame.slice(0));
+
+      // We might have finished analyzing in the meantime, in which case, abort.
+      if (this.currentState === this.states.DONE) {
+        break;
+      }
+
+      currentFrame = this.getFrame(video, ctx);
+      this.sendFramePair(++frameNum, width, height, lastFrame, currentFrame.slice(0));
+      progressListener.onFramesDecoded(frameNum, this._totalFrameEstimate);
       lastFrame = currentFrame;
+    }
+
+    if (this.currentState !== this.states.DONE) {
+      this.sendDone();
     }
 
     video.remove();
     canvas.remove();
 
     let results = await this.waitUntilDone;
+
+    this.stop();
+
     return { filename: this._videoName, results };
+  }
+
+  stop() {
+    if (this._currentState != this.states.DONE) {
+      this._worker.terminate();
+      this.currentState = this.states.DONE;
+      this._progressListener.onFramesProcessed(this._totalFrameEstimate, this._totalFrameEstimate);
+      this.log("Worker has shut down");
+    }
   }
 
   async constructDOMElements(videoURL) {
@@ -109,7 +185,7 @@ class Analyzer {
     canvas.style.height = height + "px";
     ctx.scale(ratio, ratio);
 
-    return { video, canvas, ctx };
+    return { video, canvas, ctx, width, height };
   }
 
   getFrame(video, ctx) {
@@ -119,18 +195,243 @@ class Analyzer {
     return ctx.getImageData(0, 0, width, height).data;
   }
 
-  sendFramePair(frameNum, lastFrame, currentFrame) {
+  sendFramePair(frameNum, width, height, lastFrame, currentFrame) {
     this._worker.postMessage({
       name: "framepair",
       frameNum,
+      width,
+      height,
+      lastFrameBuffer: lastFrame.buffer,
+      currentFrameBuffer: currentFrame.buffer,
     }, [
       lastFrame.buffer,
       currentFrame.buffer,
     ]);
+
+    console.assert(!lastFrame.byteLength);
+    console.assert(!currentFrame.byteLength);
+  }
+
+  sendDone() {
+    this._worker.postMessage({
+      name: "done",
+    });
   }
 
   log(...args) {
-    console.log(`${this._videoName}: `, ...args);
+    console.log(`Differentiator: ${this._videoName}: `, ...args);
+  }
+}
+
+class Analyzer {
+  static Factory(type, filename, differentiator, mode, progressListener) {
+    if (type == "firefox") {
+      return new FirefoxAnalyzer(filename, differentiator, mode, progressListener);
+    } else {
+      throw new Error(`Don't know how to analyze for type ${type}`);
+    }
+  }
+}
+
+Analyzer.FIND_ONLY_LAUNCH = Symbol("Find only launch frame");
+Analyzer.LAUNCH_SQUARE_WIDTH = 20;
+Analyzer.LAUNCH_SQUARE_HEIGHT = 20;
+Analyzer.EVENT_LAUNCH = Symbol("Process launch");
+Analyzer.EVENT_FIRST_BLANK = Symbol("First blank paint");
+
+class FirefoxAnalyzer {
+  constructor(filename, differentiator, mode, progressListener) {
+    this.states = {
+      FINDING_LAUNCH: Symbol("Finding launch frame"),
+      FINDING_FIRST_BLANK: Symbol("Finding first blank frame"),
+      DONE: Symbol("Done"),
+    }
+
+    this._currentState = this.states.FINDING_LAUNCH;
+
+    this._filename = filename;
+    this._differentiator = differentiator;
+    this._progressListener = progressListener;
+
+    this._differences = [];
+    this._promise = new Promise((resolve, reject) => {
+      this._resolve = resolve;
+      this._reject = reject;
+    });
+
+    this._timeline = {};
+
+    this._mode = mode;
+    this.log("Running in mode", mode);
+  }
+
+  async go() {
+    this._differentiatorPromise = this._differentiator.go({
+      onDifference: this.onDifference.bind(this),
+    }, this._progressListener);
+
+    let timeline = await this._promise;
+    return {
+      filename: this._filename,
+      timeline,
+    };
+  }
+
+  stop() {
+    this.currentState = this.states.DONE;
+  }
+
+  get currentState() {
+    return this._currentState;
+  }
+
+  set currentState(state) {
+    switch (state) {
+      case this.states.FINDING_LAUNCH: {
+        throw new Error("Should not be able to go back to FINDING_LAUNCH state");
+        break;
+      }
+      case this.states.FINDING_FIRST_BLANK: {
+        console.assert(this.currentState === this.states.FINDING_LAUNCH);
+        this.log("Entering FINDING_FIRST_BLANK state");
+        break;
+      }
+      case this.states.DONE: {
+        // We're done here
+        this.log("Entering DONE state", this._timeline);
+        this._resolve(this._timeline);
+        this._differentiator.stop();
+        break;
+      }
+    }
+    this._currentState = state;
+  }
+
+  updateTimeline(event, value) {
+    console.assert(this.currentState != this.states.DONE);
+    console.assert(this._progressListener);
+    this._timeline[event] = value;
+    this._progressListener.onTimelineEvent(event, value);
+  }
+
+  onDifference(difference) {
+    this.log(difference);
+    this._differences.push(difference);
+    this.log(`Saw ${this._differences.length} differences`);
+
+    for (let rect of difference.rects) {
+      switch(this.currentState) {
+        case this.states.FINDING_LAUNCH: {
+          if (rect.width == Analyzer.LAUNCH_SQUARE_WIDTH &&
+              rect.height == Analyzer.LAUNCH_SQUARE_HEIGHT) {
+            this.log(`Found launch frame at ${difference.frameNum}`);
+            this.updateTimeline(Analyzer.EVENT_LAUNCH, difference.frameNum);
+            if (this._mode === Analyzer.FIND_ONLY_LAUNCH) {
+              this.currentState = this.states.DONE;
+            } else {
+              this.currentState = this.states.FINDING_FIRST_BLANK;
+            }
+          }
+          break;
+        }
+      }
+
+      if (this.currentState === this.states.DONE) {
+        break;
+      }
+    }
+  }
+
+  log(...args) {
+    console.log(`FirefoxAnalyzer: ${this._filename}:`, ...args);
+  }
+}
+
+class VideoCropper {
+  constructor(videoName, videoURL) {
+    this._videoName = videoName;
+    this._videoURL = videoURL;
+  }
+
+  async crop(cropFrom) {
+    let video = await this.constructDOMElements(this._videoURL);
+    let frame = 0;
+    this.log("Seeking to ", cropFrom);
+    while (frame < cropFrom) {
+      await video.seekToNextFrame();
+      frame++;
+    }
+    this.log("Done seeking");
+
+    await video.play();
+    let stream = video.mozCaptureStreamUntilEnded();
+
+    let ended = new Promise(resolve => {
+      video.addEventListener("pause", resolve, { once: true });
+      // video.addEventListener("ended", resolve, { once: true });
+    });
+
+    let recordedChunks = [];
+    let options = {
+      mimeType: "video/webm; codecs=vp8",
+      videoBitesPerSecond: 1000000,
+    };
+    let recorder = new MediaRecorder(stream, options);
+
+    video.addEventListener("timeupdate", (e) => {
+      this.log(video.currentTime);
+      if (video.currentTime > 10) {
+        video.pause();
+      }
+    });
+
+    let handleDataAvailable = (event) => {
+      if (event.data.size > 0) {
+        this.log("Pushing data with size", event.data.size);
+        recordedChunks.push(event.data);
+      }
+    };
+
+    recorder.ondataavailable = handleDataAvailable;
+    recorder.start();
+
+    this.log(recorder.state);
+
+    this.log("Waiting until end of video");
+    await ended;
+    this.log("Video ended - stopping recorder...");
+    let recorderStopped = new Promise(resolve => {
+      recorder.addEventListener("stop", resolve, { once: true });
+    });
+    recorder.stop();
+    await recorderStopped;
+    this.log("Recorder stopped");
+
+    let blob = new Blob(recordedChunks, {
+      type: "video/webm",
+    });
+    this.log("Creating object URL");
+    let url = URL.createObjectURL(blob);
+    video.remove();
+
+    this.log("URL", url);
+    return url;
+  }
+
+  async constructDOMElements(videoURL) {
+    let video = document.createElement("video");
+    document.body.appendChild(video);
+
+    video.src = videoURL;
+    await new Promise(resolve => {
+      video.addEventListener("loadeddata", resolve, { once: true });
+    });
+
+    return video;
+  }
+
+  log(...args) {
+    console.log(`Cropper for ${this._videoName}:`, ...args);
   }
 }
 
@@ -138,12 +439,15 @@ class CropTop {
   init() {
     this.files = [];
     this.promises = [];
+    this.analyzers = [];
 
     this.getters = [
       "dropzone",
       "list",
       "logger",
       "start",
+      "stop",
+      "resultsbody",
     ];
 
     for (let id of this.getters) {
@@ -175,8 +479,15 @@ class CropTop {
         break;
       }
       case "click": {
-        if (event.target == this.$start) {
-          this.start();
+        switch (event.target) {
+          case this.$start: {
+            this.start();
+            break;
+          }
+          case this.$stop: {
+            this.stop();
+            break;
+          }
         }
         break;
       }
@@ -188,8 +499,6 @@ class CropTop {
     event.preventDefault();
 
     let files = event.dataTransfer.files;
-    this.files = [];
-    this.$list.innerHTML = "";
 
     for (let file of files) {
       if (!file.type.includes("video")) {
@@ -207,13 +516,92 @@ class CropTop {
   start() {
     console.log("Booting up analyzers...");
     for (let file of this.files) {
-      file.analyzer = new Analyzer(file.filename, file.url, "firefox", {});
-      this.promises.push(file.analyzer.go());
+
+      let tr = document.createElement("tr");
+
+      let filenameCol = document.createElement("td");
+      filenameCol.textContent = file.filename;
+      tr.appendChild(filenameCol);
+
+      let decodedFramesCol = document.createElement("td");
+      let decodedFramesProgress = document.createElement("progress");
+      decodedFramesProgress.value = 0;
+      decodedFramesProgress.max = 1;
+
+      decodedFramesCol.appendChild(decodedFramesProgress);
+      tr.appendChild(decodedFramesCol);
+
+      let processFramesCol = document.createElement("td");
+      let processFramesProgress = document.createElement("progress");
+      processFramesProgress.value = 0;
+      processFramesProgress.max = 1;
+      processFramesCol.appendChild(processFramesProgress);
+      tr.appendChild(processFramesCol);
+
+      let launchCol = document.createElement("td");
+      launchCol.textContent = "?";
+      tr.appendChild(launchCol);
+
+      let croppedCol = document.createElement("td");
+      let croppedLink = document.createElement("a");
+      croppedCol.appendChild(croppedLink);
+      tr.appendChild(croppedCol);
+
+      this.$resultsbody.appendChild(tr);
+
+      let progressListener = {
+        onFramesDecoded(current, totalEstimate) {
+          decodedFramesProgress.value = current;
+          decodedFramesProgress.max = totalEstimate;
+        },
+
+        onFramesProcessed(current, totalEstimate) {
+          processFramesProgress.value = current;
+          processFramesProgress.max = totalEstimate;
+        },
+
+        onTimelineEvent(timelineEvent, value) {
+          switch(timelineEvent) {
+            case Analyzer.EVENT_LAUNCH: {
+              launchCol.textContent = value;
+              break;
+            }
+          }
+        }
+      };
+
+      let differentiator = new Differentiator(file.filename, file.url);
+
+      file.analyzer = Analyzer.Factory("firefox", file.filename,
+                                       differentiator, Analyzer.FIND_ONLY_LAUNCH,
+                                       progressListener);
+      this.analyzers.push(file.analyzer);
+      let runAnalyzer = async () => {
+        console.log("Running analyzer");
+        let results = await file.analyzer.go();
+        console.log("Creating cropper");
+        let cropper = new VideoCropper(file.filename, file.url);
+        const CROP_BUFFER = 20;
+        let cropFrame = results.timeline[Analyzer.EVENT_LAUNCH] - CROP_BUFFER;
+        console.log("Cropping to frame " + cropFrame);
+        let croppedVideoURL = await cropper.crop(cropFrame);
+        console.log("Done crop - got URL: " + croppedVideoURL);
+        croppedLink.href = croppedVideoURL;
+        croppedLink.textContent = "[Cropped]";
+        return results;
+      };
+      this.promises.push(runAnalyzer());
     }
 
     Promise.all(this.promises).then((results) => {
       console.log("DONE", results);
     });
+  }
+
+  stop() {
+    for (let analyzer of this.analyzers) {
+      this.analyzer.stop();
+    }
   }
 };
 
