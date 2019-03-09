@@ -1,7 +1,7 @@
 "use strict";
 
 class Differentiator {
-  constructor(videoName, videoURL, frameRate) {
+  constructor(videoName, videoURL, numWorkers = 8) {
     const WORKER_URL = "differentiator_worker.js";
     this.states = {
       IDLE: Symbol("idle"),
@@ -11,9 +11,25 @@ class Differentiator {
     };
     this._currentState = this.states.IDLE;
 
-    this._worker = new Worker(WORKER_URL);
-    this._worker.postMessage({ name: "init" });
-    this._worker.addEventListener("message", this);
+    this._numWorkers = numWorkers;
+    this._workers = [];
+    this._readyWorkers = 0;
+    this._doneWorkers = 0;
+
+    for (let i = 0; i < this._numWorkers; ++i) {
+      let worker = new Worker(WORKER_URL);
+      worker.postMessage({ name: "init" });
+      worker.addEventListener("message", this);
+      this._workers.push(worker);
+    }
+
+    this._differences = [];
+    this._differences[0] = true;
+    this._playhead = 0;
+    this._numProcessed = 0;
+
+    this._startTime = window.performance.now();
+
     this._videoName = videoName;
     this._videoURL = videoURL;
     this.waitUntilDone = new Promise((resolve, reject) => {
@@ -25,9 +41,12 @@ class Differentiator {
   handleEvent(message) {
     switch(message.data.name) {
       case "ready": {
-        this.currentState = this.states.READY;
-        if (this._readyResolver) {
-          this._readyResolver();
+        this._readyWorkers++;
+        if (this._readyWorkers == this._numWorkers) {
+          this.currentState = this.states.READY;
+          if (this._readyResolver) {
+            this._readyResolver();
+          }
         }
         break;
       }
@@ -35,11 +54,11 @@ class Differentiator {
       case "difference": {
         console.assert(this.currentState == this.states.FINDING_DIFFERENCES);
         console.assert(this._callbacks);
-        let difference = {
-          frameNum: message.data.frameNum,
-          rects: message.data.rects,
-        };
-        this._callbacks.onDifference(difference);
+        let slotIndex = message.data.frameNum;
+        let slot = this._differences[slotIndex];
+        console.assert(slot === undefined);
+
+        this._differences[slotIndex] = message.data.rects;
         break;
       }
 
@@ -47,13 +66,26 @@ class Differentiator {
         console.assert(this.currentState == this.states.FINDING_DIFFERENCES);
         console.assert(this._progressListener);
         console.assert(this._totalFrameEstimate);
-        this._progressListener.onFramesProcessed(message.data.frameNum, this._totalFrameEstimate);
+        let slotIndex = message.data.frameNum;
+        let slot = this._differences[slotIndex];
+        console.assert(slot === undefined ||
+                       Array.isArray(slot));
+        if (slot === undefined) {
+          this._differences[slotIndex] = true;
+        }
+        this.maybeAdvancePlayhead();
+        this._numProcessed++;
+        this._progressListener.onFramesProcessed(this._numProcessed, this._totalFrameEstimate);
         break;
       }
 
       case "finished": {
-        this._callbacks.onDone();
-        this._workerResults(message.data.results);
+        this._doneWorkers++;
+        if (this._doneWorkers == this._numWorkers) {
+          console.log("TOTAL TIME: " + (window.performance.now() - this._startTime));
+          this._callbacks.onDone();
+          this._workerResults(this._differences);
+        }
         break;
       }
 
@@ -61,6 +93,20 @@ class Differentiator {
         this._workerError(message.data.error);
         break;
       }
+    }
+  }
+
+  maybeAdvancePlayhead() {
+    let currentSlot = this._differences[this._playhead];
+    while (currentSlot !== undefined) {
+      if (Array.isArray(currentSlot)) {
+        this._callbacks.onDifference({
+          frameNum: this._playhead,
+          rects: currentSlot,
+        });
+      }
+      this._playhead++;
+      currentSlot = this._differences[this._playhead];
     }
   }
 
@@ -97,12 +143,12 @@ class Differentiator {
     this._progressListener = progressListener;
 
     if (this.currentState != this.states.READY) {
-      this.log("Waiting for worker to be ready.");
+      this.log("Waiting for workers to be ready.");
       await new Promise(resolve => {
         this._readyResolver = resolve;
       });
     }
-    this.log("Worker is ready.");
+    this.log("Workers are ready.");
 
     let { video, canvas, ctx, width, height } =
       await this.constructDOMElements(this._videoURL);
@@ -153,10 +199,13 @@ class Differentiator {
 
   stop() {
     if (this._currentState != this.states.DONE) {
-      this._worker.terminate();
+      for (let worker of this._workers) {
+        worker.terminate();
+      }
       this.currentState = this.states.DONE;
       this._progressListener.onFramesProcessed(this._totalFrameEstimate, this._totalFrameEstimate);
-      this.log("Worker has shut down");
+      this.log("Workers have shut down");
+      console.log(this._differences);
     }
   }
 
@@ -198,7 +247,9 @@ class Differentiator {
   }
 
   sendFramePair(frameNum, width, height, lastFrame, currentFrame) {
-    this._worker.postMessage({
+    let workerIndex = frameNum % this._numWorkers;
+    let worker = this._workers[workerIndex];
+    worker.postMessage({
       name: "framepair",
       frameNum,
       width,
@@ -215,9 +266,11 @@ class Differentiator {
   }
 
   sendDone() {
-    this._worker.postMessage({
-      name: "done",
-    });
+    for (let worker of this._workers) {
+      worker.postMessage({
+        name: "done",
+      });
+    }
   }
 
   log(...args) {
