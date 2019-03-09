@@ -13,6 +13,20 @@ class DifferentiatorWorker {
     postMessage({ name: "ready"});
   }
 
+  almostEquals(left, right, epsilon = 3) {
+    return Math.abs(left - right) <= epsilon;
+  }
+
+  rectQualifies(rect) {
+    // Ignore rects for the blinking text cursor
+    if (this.almostEquals(rect.width, 10) &&
+        this.almostEquals(rect.height, 31)) {
+      return false;
+    }
+
+    return true;
+  }
+
   handleEvent(message) {
     switch(message.data.name) {
       case "framepair": {
@@ -39,24 +53,61 @@ class DifferentiatorWorker {
 
         let isDifferent = cv.countNonZero(thresh);
         if (isDifferent) {
-          let contours = new cv.MatVector();
-          let hierarchy = new cv.Mat();
-          cv.findContours(thresh, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+          // See if the top-right 50x50 square of the current frame is all white. If so,
+          // and if the previous frame's top-right 50x50 square is also different, then
+          // consider this the blank frame.
+          let rect = new cv.Rect(width - 51, 0, 50, 50);
+          let threshTopRight = new cv.Mat();
+          threshTopRight = thresh.roi(rect);
 
-          let rects = [];
-          for (let i = 0; i < contours.size(); ++i) {
-            let rect = cv.boundingRect(contours.get(i));
-            rects.push({
-              x: rect.x,
-              y: rect.y,
-              width: rect.width,
-              height: rect.height
-            });
+          let topRightIsDifferent = cv.countNonZero(threshTopRight);
+
+          if (topRightIsDifferent) {
+            // Check to see if the top right rect is mostly white.
+            let currentTopRight = new cv.Mat();
+            currentTopRight = currentFrameMat.roi(rect);
+            cv.threshold(currentTopRight, currentTopRight, 220, 255, cv.THRESH_BINARY_INV);
+
+            if (cv.countNonZero(currentTopRight) == 0) {
+              // It's white!
+              postMessage({
+                name: "difference",
+                frameNum,
+                rects: [{
+                  x: 0,
+                  y: 0,
+                  width: 1276,
+                  height: 678,
+                }],
+              });
+            }
+
+            threshTopRight.delete();
+            currentTopRight.delete();
+          } else {
+            let contours = new cv.MatVector();
+            let hierarchy = new cv.Mat();
+            cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+            let rects = [];
+            for (let i = 0; i < contours.size(); ++i) {
+              let rect = cv.boundingRect(contours.get(i));
+              if (this.rectQualifies(rect)) {
+                rects.push({
+                  x: rect.x,
+                  y: rect.y,
+                  width: rect.width,
+                  height: rect.height
+                });
+              }
+            }
+            contours.delete();
+            hierarchy.delete();
+
+            if (rects.length) {
+              postMessage({ name: "difference", frameNum, rects });
+            }
           }
-          contours.delete();
-          hierarchy.delete();
-
-          postMessage({ name: "difference", frameNum, rects });
         }
 
         thresh.delete();

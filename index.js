@@ -52,6 +52,7 @@ class Differentiator {
       }
 
       case "finished": {
+        this._callbacks.onDone();
         this._workerResults(message.data.results);
         break;
       }
@@ -107,6 +108,7 @@ class Differentiator {
       await this.constructDOMElements(this._videoURL);
     let ended = false;
     video.addEventListener("ended", () => {
+      this.log("Video has ended.");
       ended = true;
     }, { once: true });
 
@@ -234,18 +236,26 @@ class Analyzer {
 }
 
 Analyzer.FIND_ONLY_LAUNCH = Symbol("Find only launch frame");
-Analyzer.LAUNCH_SQUARE_WIDTH = 20;
-Analyzer.LAUNCH_SQUARE_HEIGHT = 20;
+Analyzer.SCAN_NORMAL = Symbol("Find the normal timeline events");
+Analyzer.LAUNCH_SQUARE_WIDTH = 23;
+Analyzer.LAUNCH_SQUARE_HEIGHT = 23;
+Analyzer.LAUNCH_SQUARE_X = 1883;
+Analyzer.LAUNCH_SQUARE_Y = 1038;
 Analyzer.EVENT_LAUNCH = Symbol("Process launch");
 Analyzer.EVENT_FIRST_BLANK = Symbol("First blank paint");
+Analyzer.EVENT_SETTLED = Symbol("UI settled");
 
 class FirefoxAnalyzer {
   constructor(filename, differentiator, mode, progressListener) {
     this.states = {
       FINDING_LAUNCH: Symbol("Finding launch frame"),
       FINDING_FIRST_BLANK: Symbol("Finding first blank frame"),
+      FINDING_SETTLED: Symbol("Finding the last frame with difference"),
       DONE: Symbol("Done"),
     }
+
+    this.FIRST_BLANK_WIDTH = 1276;
+    this.FIRST_BLANK_HEIGHT = 678;
 
     this._currentState = this.states.FINDING_LAUNCH;
 
@@ -268,6 +278,7 @@ class FirefoxAnalyzer {
   async go() {
     this._differentiatorPromise = this._differentiator.go({
       onDifference: this.onDifference.bind(this),
+      onDone: this.onDifferentiatorDone.bind(this),
     }, this._progressListener);
 
     let timeline = await this._promise;
@@ -314,16 +325,28 @@ class FirefoxAnalyzer {
     this._progressListener.onTimelineEvent(event, value);
   }
 
+  almostEqual(left, right, epsilon = 3) {
+    return Math.abs(left - right) <= epsilon;
+  }
+
+  probablyLaunchFrame(rect) {
+    if (this.almostEqual(rect.width, Analyzer.LAUNCH_SQUARE_WIDTH) &&
+        this.almostEqual(rect.height, Analyzer.LAUNCH_SQUARE_HEIGHT) &&
+        this.almostEqual(rect.x, Analyzer.LAUNCH_SQUARE_X) &&
+        this.almostEqual(rect.y, Analyzer.LAUNCH_SQUARE_Y)) {
+      return true;
+    }
+    return false;
+  }
+
   onDifference(difference) {
     this.log(difference);
     this._differences.push(difference);
-    this.log(`Saw ${this._differences.length} differences`);
 
     for (let rect of difference.rects) {
       switch(this.currentState) {
         case this.states.FINDING_LAUNCH: {
-          if (rect.width == Analyzer.LAUNCH_SQUARE_WIDTH &&
-              rect.height == Analyzer.LAUNCH_SQUARE_HEIGHT) {
+          if (this.probablyLaunchFrame(rect)) {
             this.log(`Found launch frame at ${difference.frameNum}`);
             this.updateTimeline(Analyzer.EVENT_LAUNCH, difference.frameNum);
             if (this._mode === Analyzer.FIND_ONLY_LAUNCH) {
@@ -334,12 +357,33 @@ class FirefoxAnalyzer {
           }
           break;
         }
+
+        case this.states.FINDING_FIRST_BLANK: {
+          if (rect.width >= this.FIRST_BLANK_WIDTH &&
+              rect.height >= this.FIRST_BLANK_HEIGHT) {
+            this.log(`Found first blank frame at ${difference.frameNum}`);
+            this.updateTimeline(Analyzer.EVENT_FIRST_BLANK, difference.frameNum);
+            this.currentState = this.states.FINDING_SETTLED;
+          }
+
+          break;
+        }
+
+        case this.states.FINDING_SETTLED: {
+          this._lastDifferenceFrame = difference.frameNum;
+        }
       }
 
       if (this.currentState === this.states.DONE) {
         break;
       }
     }
+  }
+
+  onDifferentiatorDone() {
+    this.log("Found last difference frame: " + this._lastDifferenceFrame);
+    this.updateTimeline(Analyzer.EVENT_SETTLED, this._lastDifferenceFrame);
+    this.currentState = this.states.DONE;
   }
 
   log(...args) {
@@ -367,23 +411,15 @@ class VideoCropper {
     let stream = video.mozCaptureStreamUntilEnded();
 
     let ended = new Promise(resolve => {
-      video.addEventListener("pause", resolve, { once: true });
-      // video.addEventListener("ended", resolve, { once: true });
+      video.addEventListener("ended", resolve, { once: true });
     });
 
     let recordedChunks = [];
     let options = {
       mimeType: "video/webm; codecs=vp8",
-      videoBitesPerSecond: 1000000,
+      videoBitesPerSecond: 10000000,
     };
     let recorder = new MediaRecorder(stream, options);
-
-    video.addEventListener("timeupdate", (e) => {
-      this.log(video.currentTime);
-      if (video.currentTime > 10) {
-        video.pause();
-      }
-    });
 
     let handleDataAvailable = (event) => {
       if (event.data.size > 0) {
@@ -434,6 +470,8 @@ class VideoCropper {
     console.log(`Cropper for ${this._videoName}:`, ...args);
   }
 }
+
+const MSPF = 16.67; // ms per frame
 
 class CropTop {
   init() {
@@ -542,6 +580,14 @@ class CropTop {
       launchCol.textContent = "?";
       tr.appendChild(launchCol);
 
+      let firstBlankCol = document.createElement("td");
+      firstBlankCol.textContent = "?";
+      tr.appendChild(firstBlankCol);
+
+      let settledCol = document.createElement("td");
+      settledCol.textContent = "?";
+      tr.appendChild(settledCol);
+
       let croppedCol = document.createElement("td");
       let croppedLink = document.createElement("a");
       croppedCol.appendChild(croppedLink);
@@ -550,6 +596,8 @@ class CropTop {
       this.$resultsbody.appendChild(tr);
 
       let progressListener = {
+        _origin: 0,
+
         onFramesDecoded(current, totalEstimate) {
           decodedFramesProgress.value = current;
           decodedFramesProgress.max = totalEstimate;
@@ -564,6 +612,17 @@ class CropTop {
           switch(timelineEvent) {
             case Analyzer.EVENT_LAUNCH: {
               launchCol.textContent = value;
+              this._origin = value;
+              break;
+            }
+            case Analyzer.EVENT_FIRST_BLANK: {
+              let time = Math.ceil((value - this._origin) * MSPF);
+              firstBlankCol.textContent = time;
+              break;
+            }
+            case Analyzer.EVENT_SETTLED: {
+              let time = Math.ceil((value - this._origin) * MSPF);
+              settledCol.textContent = time;
               break;
             }
           }
@@ -573,7 +632,7 @@ class CropTop {
       let differentiator = new Differentiator(file.filename, file.url);
 
       file.analyzer = Analyzer.Factory("firefox", file.filename,
-                                       differentiator, Analyzer.FIND_ONLY_LAUNCH,
+                                       differentiator, Analyzer.SCAN_NORMAL,
                                        progressListener);
       this.analyzers.push(file.analyzer);
       let runAnalyzer = async () => {
@@ -581,7 +640,7 @@ class CropTop {
         let results = await file.analyzer.go();
         console.log("Creating cropper");
         let cropper = new VideoCropper(file.filename, file.url);
-        const CROP_BUFFER = 20;
+        const CROP_BUFFER = 15;
         let cropFrame = results.timeline[Analyzer.EVENT_LAUNCH] - CROP_BUFFER;
         console.log("Cropping to frame " + cropFrame);
         let croppedVideoURL = await cropper.crop(cropFrame);
