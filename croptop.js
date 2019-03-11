@@ -76,7 +76,7 @@ class CropTop {
     }
   }
 
-  start() {
+  async start() {
     console.log("Booting up analyzers...");
     for (let file of this.files) {
 
@@ -164,6 +164,7 @@ class CropTop {
       let runAnalyzer = async () => {
         console.log("Running analyzer");
         let results = await file.analyzer.go();
+        /*
         console.log("Creating cropper");
         let cropper = new VideoCropper(file.filename, file.url);
         const CROP_BUFFER = 15;
@@ -172,15 +173,15 @@ class CropTop {
         let croppedVideoURL = await cropper.crop(cropFrame);
         console.log("Done crop - got URL: " + croppedVideoURL);
         croppedLink.href = croppedVideoURL;
-        croppedLink.textContent = "[Cropped]";
+        croppedLink.textContent = "[Cropped]";*/
         return results;
       };
-      this.promises.push(runAnalyzer());
+      await runAnalyzer();
+      // this.promises.push(runAnalyzer());
     }
 
-    Promise.all(this.promises).then((results) => {
-      console.log("DONE", results);
-    });
+    let results = await Promise.all(this.promises);
+    console.log("DONE", results);
   }
 
   stop() {
