@@ -57,16 +57,18 @@ class DifferentiatorWorker {
           // and if the previous frame's top-right 50x50 square is also different, then
           // consider this the blank frame.
           let rect = new cv.Rect(width - 51, 0, 50, 50);
-          let threshTopRight = new cv.Mat();
-          threshTopRight = thresh.roi(rect);
+          let diffTopRight = new cv.Mat();
+          diffTopRight = diff.roi(rect);
 
-          let topRightIsDifferent = cv.countNonZero(threshTopRight);
+          cv.threshold(diffTopRight, diffTopRight, 127, 255, cv.THRESH_BINARY);
+
+          let topRightIsDifferent = cv.countNonZero(diffTopRight);
 
           if (topRightIsDifferent) {
             // Check to see if the top right rect is mostly white.
             let currentTopRight = new cv.Mat();
             currentTopRight = currentFrameMat.roi(rect);
-            cv.threshold(currentTopRight, currentTopRight, 220, 255, cv.THRESH_BINARY_INV);
+            cv.threshold(currentTopRight, currentTopRight, 169, 255, cv.THRESH_BINARY_INV);
 
             if (cv.countNonZero(currentTopRight) == 0) {
               // It's white!
@@ -82,7 +84,7 @@ class DifferentiatorWorker {
               });
             }
 
-            threshTopRight.delete();
+            diffTopRight.delete();
             currentTopRight.delete();
           } else {
             let contours = new cv.MatVector();

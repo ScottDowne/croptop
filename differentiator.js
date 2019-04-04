@@ -1,7 +1,7 @@
 "use strict";
 
 class Differentiator {
-  constructor(videoName, videoURL, numWorkers = 8) {
+  constructor(videoName, videoURL, numWorkers = 6, debug = false) {
     const WORKER_URL = "differentiator_worker.js";
     this.states = {
       IDLE: Symbol("idle"),
@@ -10,6 +10,18 @@ class Differentiator {
       DONE: Symbol("done"),
     };
     this._currentState = this.states.IDLE;
+
+    this._debug = debug;
+    if (debug && !window.cv) {
+      // Hack hack hack
+      let script = document.createElement("script");
+      script.setAttribute("type", "application/javascript");
+      script.src = "opencv.js";
+      document.head.appendChild(script);
+
+      this._debugThreshList = document.createElement("ul");
+      document.body.appendChild(this._debugThreshList);
+    }
 
     this._numWorkers = numWorkers;
     this._workers = [];
@@ -247,22 +259,25 @@ class Differentiator {
   }
 
   sendFramePair(frameNum, width, height, lastFrame, currentFrame) {
-    let workerIndex = frameNum % this._numWorkers;
-    let worker = this._workers[workerIndex];
-    worker.postMessage({
-      name: "framepair",
-      frameNum,
-      width,
-      height,
-      lastFrameBuffer: lastFrame.buffer,
-      currentFrameBuffer: currentFrame.buffer,
-    }, [
-      lastFrame.buffer,
-      currentFrame.buffer,
-    ]);
-
-    console.assert(!lastFrame.byteLength);
-    console.assert(!currentFrame.byteLength);
+    if (this._debug) {
+      this.debugFramePair(frameNum, width, height, lastFrame, currentFrame);
+    } else {
+      let workerIndex = frameNum % this._numWorkers;
+      let worker = this._workers[workerIndex];
+      worker.postMessage({
+        name: "framepair",
+        frameNum,
+        width,
+        height,
+        lastFrameBuffer: lastFrame.buffer,
+        currentFrameBuffer: currentFrame.buffer,
+      }, [
+        lastFrame.buffer,
+        currentFrame.buffer,
+      ]);
+      console.assert(!lastFrame.byteLength);
+      console.assert(!currentFrame.byteLength);
+    }
   }
 
   sendDone() {
@@ -275,5 +290,125 @@ class Differentiator {
 
   log(...args) {
     console.log(`Differentiator: ${this._videoName}: `, ...args);
+  }
+
+  debugFramePair(frameNum, width, height, lastFrame, currentFrame) {
+    /*if (frameNum < 209 || frameNum > 211) {
+      return;
+    }*/
+    
+    if (frameNum != 37) {
+      return;
+    }
+
+    let lastFrameBuffer = lastFrame.buffer;
+    let currentFrameBuffer = currentFrame.buffer;
+
+    let lastFrameMat = new cv.Mat(height, width, cv.CV_8UC4);
+    lastFrameMat.data.set(new Uint8Array(lastFrameBuffer));
+    cv.cvtColor(lastFrameMat, lastFrameMat, cv.COLOR_BGR2GRAY);
+
+    let currentFrameMat = new cv.Mat(height, width, cv.CV_8UC4);
+    currentFrameMat.data.set(new Uint8Array(currentFrameBuffer));
+    cv.cvtColor(currentFrameMat, currentFrameMat, cv.COLOR_BGR2GRAY);
+
+    let diff = new cv.Mat(height, width, cv.CV_8UC4);
+    cv.absdiff(currentFrameMat, lastFrameMat, diff);
+
+    let thresh = new cv.Mat(height, width, cv.CV_8UC4);
+    cv.adaptiveThreshold(diff, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 5);
+
+    let isDifferent = cv.countNonZero(thresh);
+
+    console.log(`Frame ${frameNum} is different?: ${isDifferent}`);
+    let li = document.createElement("li");
+    let header = document.createElement("h5");
+    header.textContent = `Frame #${frameNum}`;
+    li.appendChild(header);
+
+    let lastCanvas = document.createElement("canvas");
+    lastCanvas.id = `croptop-debug-id-last-${frameNum}`;
+    li.appendChild(lastCanvas);
+
+    let currentCanvas = document.createElement("canvas");
+    currentCanvas.id = `croptop-debug-id-current-${frameNum}`;
+    li.appendChild(currentCanvas);
+
+    let diffCanvas = document.createElement("canvas");
+    diffCanvas.id = `croptop-debug-id-diff-${frameNum}`;
+    li.appendChild(diffCanvas);
+
+    let threshCanvas = document.createElement("canvas");
+    threshCanvas.id = `croptop-debug-id-thresh-${frameNum}`;
+    li.appendChild(threshCanvas);
+
+    let toprightCanvas = document.createElement("canvas");
+    toprightCanvas.id = `croptop-debug-topright-${frameNum}`;
+    li.appendChild(toprightCanvas);
+
+    this._debugThreshList.appendChild(li);
+
+    cv.imshow(lastCanvas.id, lastFrameMat);
+    cv.imshow(currentCanvas.id, currentFrameMat);
+    cv.imshow(diffCanvas.id, diff);
+    cv.imshow(threshCanvas.id, thresh);
+
+    if (isDifferent) {
+      // See if the top-right 50x50 square of the current frame is all white. If so,
+      // and if the previous frame's top-right 50x50 square is also different, then
+      // consider this the blank frame.
+      let rect = new cv.Rect(width - 51, 0, 50, 50);
+      let diffTopRight = new cv.Mat();
+      diffTopRight = diff.roi(rect);
+
+      cv.threshold(diffTopRight, diffTopRight, 127, 255, cv.THRESH_BINARY);
+
+      let topRightIsDifferent = cv.countNonZero(diffTopRight);
+      cv.imshow(toprightCanvas.id, diffTopRight);
+
+      if (topRightIsDifferent) {
+        console.log("Top right is different");
+        // Check to see if the top right rect is mostly white.
+        let currentTopRight = new cv.Mat();
+        currentTopRight = currentFrameMat.roi(rect);
+        cv.threshold(currentTopRight, currentTopRight, 220, 255, cv.THRESH_BINARY_INV);
+
+        if (cv.countNonZero(currentTopRight) == 0) {
+          // It's white!
+          console.log("Top right is apparently white - good candidate for first blank");
+        }
+
+        diffTopRight.delete();
+        currentTopRight.delete();
+      } else {
+        console.log("Gathering contours");
+        let contours = new cv.MatVector();
+        let hierarchy = new cv.Mat();
+        cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+        let rects = [];
+        for (let i = 0; i < contours.size(); ++i) {
+          let rect = cv.boundingRect(contours.get(i));
+          rects.push({
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height
+          });
+        }
+        contours.delete();
+        hierarchy.delete();
+
+        if (rects.length) {
+          console.log(rects);
+        }
+      }
+    }
+
+
+    thresh.delete();
+    currentFrameMat.delete();
+    lastFrameMat.delete();
+    diff.delete();
   }
 }
